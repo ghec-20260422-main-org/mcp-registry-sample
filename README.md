@@ -6,13 +6,20 @@ MCP Registry v0.1 API の静的レスポンスを生成して GitHub Pages に�
 
 ## 公開 URL
 
-GitHub Pages のデプロイ後、レジストリ URL は次の通りです。
+GitHub Pages のデプロイ後、サイトのルート URL は次の通りです。この URL は、
+MCP registry URL としてそのまま利用できます。
+
+```text
+https://ghec-20260422-main-org.github.io/mcp-registry-sample/
+```
+
+GitHub Pages のルートにはサイトの案内ページを配置します。GitHub Copilot の
+レジストリ設定には、API のベース URL として次の URL を指定します。
 
 ```text
 https://ghec-20260422-main-org.github.io/mcp-registry-sample/v0.1/servers
 ```
 
-GitHub Copilot のレジストリ設定には、末尾の `/v0.1/servers` を除いた URL を指定します。
 検証時は次のエンドポイントが利用できます。
 
 ```text
