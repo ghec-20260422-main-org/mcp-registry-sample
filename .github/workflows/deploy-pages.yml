@@ -29,6 +29,10 @@ jobs:
         shell: pwsh
         run: ./scripts/Build-Registry.ps1
 
+      - name: Add registry landing page
+        shell: pwsh
+        run: Copy-Item -Path site/* -Destination _site -Recurse -Force
+
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
