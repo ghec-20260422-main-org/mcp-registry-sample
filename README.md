@@ -1,82 +1,150 @@
-# 検証用 MCP レジストリ
+# Azure Functions MCP Registry
 
-GitHub Copilot の MCP レジストリ制限機能を検証するための、git-based MCP レジストリ設定です。
-このリポジトリは `mcp-registry-template` の形式で定義を管理し、GitHub Actions で
-MCP Registry v0.1 API の静的レスポンスを生成して GitHub Pages に公開します。
+GitHub CopilotのMCP Registry制限機能を検証するための、読み取り専用MCP Registry v0.1 APIです。TypeScript／Node.js 22のAzure Functions v4アプリケーションとして実装し、低アクセス時のコストを抑えるためFlex Consumption（FC1、always-readyなし）へデプロイします。
 
-## 公開 URL
+## API
 
-GitHub Pages のデプロイ後、サイトのルート URL は次の通りです。この URL は、
-MCP registry URL としてそのまま利用できます。
-
-```text
-https://ghec-20260422-main-org.github.io/mcp-registry-sample/
-```
-
-GitHub Pages のルートにはサイトの案内ページを配置します。GitHub Copilot の
-レジストリ設定には、API のベース URL として次の URL を指定します。
-
-```text
-https://ghec-20260422-main-org.github.io/mcp-registry-sample/v0.1/servers
-```
-
-検証時は次のエンドポイントが利用できます。
+GitHub Copilotが要求する3つのエンドポイントと、Generic Registry APIのバージョン一覧を実装しています。
 
 ```text
 GET /v0.1/servers
+GET /v0.1/servers/{serverName}/versions
 GET /v0.1/servers/{serverName}/versions/latest
 GET /v0.1/servers/{serverName}/versions/{version}
 ```
 
-> [!NOTE]
-> GitHub Pages はカスタムレスポンスヘッダーを設定できません。通常は
-> `Access-Control-Allow-Origin: *` が付与されますが、GitHub がレジストリに要求する
-> CORSヘッダー3種を明示制御できないため、この構成は検証用途に限定します。
+補助エンドポイントも利用できます。
 
-## 登録サーバー
+```text
+GET /             # API情報
+GET /v0.1/health  # liveness
+```
+
+`/v0.1/servers`配下では`OPTIONS`に応答し、すべての成功・エラーレスポンスで次の要件を満たします。
+
+```http
+Content-Type: application/json
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, OPTIONS
+Access-Control-Allow-Headers: Authorization, Content-Type
+```
+
+一覧では`search`、`version`、`limit`、`cursor`、`updated_since`、`include_deleted`を利用できます。現在登録しているサーバーは次の2件です。
 
 | サーバー | canonical ID | 接続先 |
 | --- | --- | --- |
-| GitHub 公式 MCP サーバー | `io.github.github/github-mcp-server` | `https://api.githubcopilot.com/mcp/` |
-| Postman 公式 MCP サーバー | `com.postman/postman-mcp-server` | `https://mcp.postman.com/minimal` |
+| GitHub MCP Server | `io.github.github/github-mcp-server` | `https://api.githubcopilot.com/mcp/` |
+| Postman MCP Server | `com.postman/postman-mcp-server` | `https://mcp.postman.com/minimal` |
 
-どちらもリモートの Streamable HTTP サーバーです。定義は
-[`registry.json`](registry.json) と `mcps/` 配下の `server.json` にあります。
-各定義の `1.0.0` は、この検証用レジストリエントリのバージョンです。
+定義を変更するときは[`src/registry-data.ts`](src/registry-data.ts)を編集します。認証情報やAPIキーはレジストリに保存しません。
 
-## 認証
+## ローカル開発
 
-- GitHub MCP は接続時に GitHub OAuth を使用します。
-- Postman MCP は Postman の OAuth または API キーを `Authorization` ヘッダーに設定します。
-
-認証情報や API キーはこのリポジトリに保存しません。クライアント側の MCP 設定で
-認証を完了してください。
-
-## デプロイ
-
-1. リポジトリの **Settings > Pages > Build and deployment** で Source を
-   **GitHub Actions** に設定します。
-2. `main` ブランチへのpush、またはActions画面からの手動実行で
-   `Deploy MCP registry to GitHub Pages` Workflowを起動します。
-3. Workflowの完了を確認します。
-
-Workflow は [`scripts/Build-Registry.ps1`](scripts/Build-Registry.ps1) を実行し、
-`registry.json` が参照する定義から、一覧・latest・指定バージョンのレスポンスを
-静的ファイルとして生成します。一覧は `servers/index.html`、個別レスポンスは
-拡張子なしのファイルとして配置し、GitHub Pages のパス解決を利用します。
-
-公開後は次のコマンドで確認できます。
+Node.js 22を使用します。
 
 ```powershell
-$baseUrl = "https://ghec-20260422-main-org.github.io/mcp-registry-sample"
-curl.exe "$baseUrl/v0.1/servers"
-curl.exe "$baseUrl/v0.1/servers/io.github.github/github-mcp-server/versions/latest"
-curl.exe "$baseUrl/v0.1/servers/com.postman/postman-mcp-server/versions/latest"
+npm ci
+npm run check
+npm test
+npm run build
 ```
 
-## 構成の変更
+Azure Functions Core Tools v4がインストールされている環境では、ビルド後にローカルホストを起動できます。
 
-サーバーを追加・削除する場合は、`registry.json` の
-`servers_relative_path` と対応する `mcps/{author}/{name}/server.json` を更新します。
-サーバー ID はクライアント側の MCP 設定で使う canonical ID と一致させてください。
-`main` への反映後、Workflow が Pages の静的APIを再生成します。
+```powershell
+npm run build
+npm start
+```
+
+## Azure構成
+
+[`infra/main.bicep`](infra/main.bicep)は専用Resource Group内に次のリソースを作成します。
+
+- Node.js 22 Azure Function App
+- Flex Consumption（FC1）App Service Plan
+- Functionsホストと非公開デプロイパッケージ用Storage Account
+- Log Analytics WorkspaceとApplication Insights
+- Function AppのManaged Identityに必要なStorageデータプレーンRBAC
+
+Function AppはHTTPSのみ、TLS 1.2以上、FTPS無効で構成されます。Storageの共有キーとBlobの匿名公開も無効です。Function AppからStorageへはManaged Identityで接続します。
+
+### 1. OIDCを一度だけ初期構築する
+
+GitHub ActionsがAzureへ接続するための信頼関係は、それ自身では作成できません。Azure CLIでサインインした権限のある運用者が、最初の一度だけ[`infra/bootstrap.bicep`](infra/bootstrap.bicep)を実行します。
+
+```powershell
+$location = "japaneast"
+$resourceGroup = "rg-mcp-registry-prod"
+
+az login
+az account set --subscription "<subscription-id>"
+az deployment sub create `
+  --name "bootstrap-mcp-registry" `
+  --location $location `
+  --template-file infra/bootstrap.bicep `
+  --parameters location=$location resourceGroupName=$resourceGroup `
+  --query properties.outputs
+```
+
+このデプロイは次を作成します。
+
+- 専用Resource Group
+- GitHub Actions用User Assigned Managed Identity
+- `ghec-20260422-main-org/mcp-registry-sample`の`main`ブランチだけを信頼するFederated Credential
+- 対象Resource Groupに限定した`Contributor`と`User Access Administrator`
+
+`User Access Administrator`は、WorkflowがFunction AppのManaged IdentityへStorageロールを割り当てるために必要です。権限は専用Resource Group外には及びません。
+
+### 2. GitHub Repository Variablesを設定する
+
+bootstrapの出力を、リポジトリの **Settings > Secrets and variables > Actions > Variables** に登録します。
+
+| Variable | 値 |
+| --- | --- |
+| `AZURE_CLIENT_ID` | `clientId`出力 |
+| `AZURE_TENANT_ID` | `tenantId`出力 |
+| `AZURE_SUBSCRIPTION_ID` | `subscriptionId`出力 |
+| `AZURE_RESOURCE_GROUP` | `resourceGroupName`出力 |
+| `AZURE_ENV_NAME` | 任意。省略時は`prod` |
+| `AZURE_FUNCTIONAPP_NAME` | 任意。省略時はBicepが一意名を生成 |
+
+client secretや発行プロファイルは使用しません。GitHub Actionsの`id-token: write`とAzure Workload Identity Federationで認証します。
+
+### 3. デプロイする
+
+`main`へのpush、またはActions画面から **Deploy MCP registry to Azure Functions** を手動実行します。Workflowは次を順番に実施します。
+
+1. 型チェックを含むビルドと自動テスト
+2. Bicepの検証とAzureリソースの更新
+3. production依存関係を含むFunctionパッケージのデプロイ
+4. ルート、health、一覧、CORSプリフライト、URLエンコード済みserver IDのライブスモークテスト
+
+デプロイ後にMCP Registry URLとして設定する値は次の形式です。
+
+```text
+https://<function-app-name>.azurewebsites.net/v0.1/servers
+```
+
+## 切り替えと旧GitHub Pagesの停止
+
+旧GitHub PagesのWorkflowと静的生成資産はこの実装で削除しています。既存URLを利用中の場合は、次の順番で切り替えてダウンタイムを避けます。
+
+1. Azure Functions Workflowが成功したことを確認する。
+2. Actionsのスモークテスト結果とAzure URLのレスポンスを確認する。
+3. GitHub Enterprise／OrganizationのMCP Registry URLを新しい`/v0.1/servers` URLへ変更する。
+4. クライアントでサーバー一覧と接続制限が反映されることを確認する。
+5. リポジトリの **Settings > Pages > Build and deployment** で公開を無効化する。
+
+PagesはAzure側の検証が終わる前に無効化しないでください。
+
+## コストと撤去
+
+Flex Consumptionはalways-readyインスタンスを構成していないため、Function実行量とメモリ使用量に応じて課金されます。この小規模なRegistryでは、API Center Standardの固定時間課金より大幅に低コストになる想定です。別途、少量のStorageとApplication Insights／Log Analyticsの使用料が発生する可能性があります。
+
+すべてのAzureリソースは専用Resource Groupに配置されます。検証を終了するときはResource Groupを削除すると一括撤去できます。
+
+```powershell
+az group delete --name "rg-mcp-registry-prod" --yes
+```
+
+削除後はGitHub Repository Variablesも削除してください。

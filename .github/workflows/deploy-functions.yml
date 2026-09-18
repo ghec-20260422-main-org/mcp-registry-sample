@@ -1,0 +1,188 @@
+name: Deploy MCP registry to Azure Functions
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-functions
+  cancel-in-progress: false
+
+env:
+  # Directory containing the Azure Functions v4 Node.js app (package.json, host.json, src).
+  # Adjust if the function app project lives elsewhere.
+  FUNCTION_APP_PROJECT_PATH: "."
+  # Base path under which the MCP registry v0.1 API is served (must match host.json routePrefix).
+  REGISTRY_API_PREFIX: /v0.1
+  # Health check path exposed by the function app.
+  HEALTH_PATH: /v0.1/health
+  DEPLOYMENT_PACKAGE: function-app.zip
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ${{ env.FUNCTION_APP_PROJECT_PATH }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.FUNCTION_APP_PROJECT_PATH }}
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ${{ env.FUNCTION_APP_PROJECT_PATH }}
+        run: npm test --if-present
+
+      - name: Build
+        working-directory: ${{ env.FUNCTION_APP_PROJECT_PATH }}
+        run: npm run build --if-present
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Bicep
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null
+
+      - name: Deploy Azure infrastructure
+        id: infra
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --name "deploy-functions-${{ github.run_id }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters \
+              environmentName="${{ vars.AZURE_ENV_NAME || 'prod' }}" \
+              functionAppName="${{ vars.AZURE_FUNCTIONAPP_NAME || '' }}" \
+            --query "properties.outputs" -o json > infra-outputs.json
+          cat infra-outputs.json
+          echo "functionAppName=$(jq -r '.functionAppName.value' infra-outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "functionAppHostName=$(jq -r '.functionAppHostName.value' infra-outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "registryUrl=$(jq -r '.registryUrl.value' infra-outputs.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Create deployment package
+        working-directory: ${{ env.FUNCTION_APP_PROJECT_PATH }}
+        run: |
+          set -euo pipefail
+          npm ci --omit=dev
+          zip -r "$GITHUB_WORKSPACE/${{ env.DEPLOYMENT_PACKAGE }}" . \
+            -x "*.git*" -x "infra/*" -x ".github/*" -x "test/*" -x "tests/*" \
+            -x "*.test.js" -x "*.test.ts" -x "local.settings.json"
+
+      - name: Deploy Azure Functions app
+        uses: Azure/functions-action@v1.5.7
+        with:
+          app-name: ${{ steps.infra.outputs.functionAppName }}
+          package: ${{ env.DEPLOYMENT_PACKAGE }}
+          sku: flexconsumption
+
+      - name: Smoke test - live registry endpoints
+        env:
+          BASE_URL: https://${{ steps.infra.outputs.functionAppHostName }}
+        run: |
+          set -euo pipefail
+
+          fail=0
+
+          check_status() {
+            local desc="$1" method="$2" url="$3" expected="$4"
+            shift 4
+            local actual
+            actual=$(curl -s -o /tmp/resp_body -D /tmp/resp_headers -w '%{http_code}' -X "$method" "$@" "$url")
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$desc -> expected HTTP $expected, got $actual ($method $url)"
+              fail=1
+            else
+              echo "OK: $desc -> HTTP $actual"
+            fi
+          }
+
+          check_header() {
+            local desc="$1" name="$2" expected="$3"
+            local actual
+            actual=$(grep -i "^$name:" /tmp/resp_headers | tail -n1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$desc -> expected '$name: $expected', got '$name: $actual'"
+              fail=1
+            else
+              echo "OK: $desc -> $name: $actual"
+            fi
+          }
+
+          check_header_contains() {
+            local desc="$1" name="$2" needle="$3"
+            local actual
+            actual=$(grep -i "^$name:" /tmp/resp_headers | tail -n1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')
+            case "$actual" in
+              *"$needle"*) echo "OK: $desc -> $name contains '$needle'" ;;
+              *) echo "::error::$desc -> expected '$name' to contain '$needle', got '$actual'"; fail=1 ;;
+            esac
+          }
+
+          # Allow for deployment propagation and the first Flex Consumption cold start.
+          ready=0
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/") || code="000"
+            if [ "$code" = "200" ]; then
+              ready=1
+              break
+            fi
+            echo "Waiting for app to become healthy (attempt $i, HTTP $code)..."
+            sleep 6
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::Function App did not return HTTP 200 within the readiness window."
+            exit 1
+          fi
+
+          # 1. Root
+          check_status "root endpoint" GET "$BASE_URL/" 200
+
+          # 2. Health check
+          check_status "health endpoint" GET "$BASE_URL$HEALTH_PATH" 200
+
+          # 3. Registry servers list - status, Content-Type, CORS
+          check_status "GET /v0.1/servers" GET "$BASE_URL$REGISTRY_API_PREFIX/servers" 200
+          check_header "servers list Content-Type" "content-type" "application/json"
+          check_header "servers list CORS origin" "access-control-allow-origin" "*"
+
+          # 4. OPTIONS preflight on servers list
+          check_status "OPTIONS /v0.1/servers preflight" OPTIONS "$BASE_URL$REGISTRY_API_PREFIX/servers" 204 \
+            -H "Origin: https://copilot.example.com" \
+            -H "Access-Control-Request-Method: GET" \
+            -H "Access-Control-Request-Headers: authorization,content-type"
+          check_header "preflight CORS origin" "access-control-allow-origin" "*"
+          check_header_contains "preflight CORS methods" "access-control-allow-methods" "GET"
+          check_header_contains "preflight CORS methods" "access-control-allow-methods" "OPTIONS"
+          check_header_contains "preflight CORS headers" "access-control-allow-headers" "Authorization"
+          check_header_contains "preflight CORS headers" "access-control-allow-headers" "Content-Type"
+
+          # 5. Encoded server ID (contains a "/") resolves correctly
+          encoded_id="io.github.github%2Fgithub-mcp-server"
+          check_status "GET versions/latest (encoded server id)" GET \
+            "$BASE_URL$REGISTRY_API_PREFIX/servers/$encoded_id/versions/latest" 200
+          check_header "encoded server id Content-Type" "content-type" "application/json"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::One or more smoke tests failed."
+            exit 1
+          fi
+
+          echo "All smoke tests passed."
